@@ -20,6 +20,8 @@ jobs:
       - name: Buscar y descomprimir ZIP
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $zip = Get-ChildItem -Path . -Filter "GeoOfficeAI*.zip" |
             Sort-Object LastWriteTime -Descending |
             Select-Object -First 1
@@ -28,12 +30,20 @@ jobs:
             throw "No se encontró ningún ZIP GeoOfficeAI."
           }
 
-          Write-Host "Usando: $($zip.Name)"
+          Write-Host "Usando ZIP: $($zip.Name)"
 
+          Remove-Item extracted -Recurse -Force -ErrorAction SilentlyContinue
           New-Item -ItemType Directory -Force extracted | Out-Null
-          Expand-Archive -Path $zip.FullName -DestinationPath extracted -Force
 
-          $solution = Get-ChildItem extracted -Filter "GeoOfficeAI.sln" -Recurse |
+          Expand-Archive `
+            -Path $zip.FullName `
+            -DestinationPath extracted `
+            -Force
+
+          $solution = Get-ChildItem `
+            -Path extracted `
+            -Filter "GeoOfficeAI.sln" `
+            -Recurse |
             Select-Object -First 1
 
           if (!$solution) {
@@ -44,28 +54,39 @@ jobs:
 
           "PROJECT_ROOT=$root" >> $env:GITHUB_ENV
 
-          Write-Host "Proyecto:"
+          Write-Host "Proyecto encontrado:"
           Write-Host $root
 
       - name: Preparar Visual Studio y VSTO
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 
           if (!(Test-Path $vswhere)) {
             throw "No se encontró Visual Studio."
           }
 
-          $install = & $vswhere -latest -products * -property installationPath
+          $install = & $vswhere `
+            -latest `
+            -products * `
+            -property installationPath
 
           if ([string]::IsNullOrWhiteSpace($install)) {
             throw "Visual Studio no está instalado."
           }
 
-          $targets = Join-Path $install "MSBuild\Microsoft\VisualStudio\v17.0\OfficeTools\Microsoft.VisualStudio.Tools.Office.targets"
+          Write-Host "Visual Studio:"
+          Write-Host $install
+
+          $targets = Join-Path `
+            $install `
+            "MSBuild\Microsoft\VisualStudio\v17.0\OfficeTools\Microsoft.VisualStudio.Tools.Office.targets"
 
           if (!(Test-Path $targets)) {
-            Write-Host "Instalando herramientas VSTO..."
+
+            Write-Host "Instalando herramientas Office/VSTO..."
 
             $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
 
@@ -81,18 +102,30 @@ jobs:
             }
           }
 
-          Write-Host "VSTO listo."
+          Write-Host "Visual Studio/VSTO listo."
 
       - name: Colocar inicio de sesión Google
         shell: pwsh
         env:
           GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
         run: |
+          $ErrorActionPreference = "Stop"
+
           if ([string]::IsNullOrWhiteSpace($env:GOOGLE_OAUTH_JSON)) {
             throw "Falta GOOGLE_OAUTH_JSON."
           }
 
-          $file = Join-Path $env:PROJECT_ROOT "GeoOfficeAI.Broker\google_oauth.json"
+          $folder = Join-Path `
+            $env:PROJECT_ROOT `
+            "GeoOfficeAI.Broker"
+
+          if (!(Test-Path $folder)) {
+            throw "No existe GeoOfficeAI.Broker."
+          }
+
+          $file = Join-Path `
+            $folder `
+            "google_oauth.json"
 
           [IO.File]::WriteAllText(
             $file,
@@ -100,12 +133,14 @@ jobs:
             [Text.Encoding]::UTF8
           )
 
-          Write-Host "Google OAuth configurado."
+          Write-Host "Google OAuth configurado correctamente."
 
-      - name: Preparar firma VSTO
+      - name: Preparar firma VSTO segura
         shell: pwsh
         run: |
-          Write-Host "Creando certificado temporal para los manifiestos VSTO..."
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Creando certificado temporal..."
 
           $cert = New-SelfSignedCertificate `
             -Type CodeSigningCert `
@@ -118,12 +153,14 @@ jobs:
             -NotAfter (Get-Date).AddYears(3)
 
           if (!$cert) {
-            throw "No se pudo crear el certificado VSTO."
+            throw "No se pudo crear certificado."
           }
 
           $thumb = $cert.Thumbprint
 
           "VSTO_CERT_THUMBPRINT=$thumb" >> $env:GITHUB_ENV
+
+          Write-Host "Certificado creado."
 
           $projects = @(
             (Join-Path $env:PROJECT_ROOT "GeoOfficeAI.Word\GeoOfficeAI.Word.csproj"),
@@ -134,92 +171,187 @@ jobs:
           foreach ($project in $projects) {
 
             if (!(Test-Path $project)) {
-              throw "No se encontró: $project"
+              throw "No existe: $project"
             }
 
-            $text = [IO.File]::ReadAllText($project)
+            Write-Host "Configurando firma:"
+            Write-Host $project
 
-            $text = $text.Replace(
-              "<SignManifests>false</SignManifests>",
-              "<SignManifests>true</SignManifests>"
+            [xml]$xml = Get-Content `
+              -Path $project `
+              -Raw
+
+            $namespace = "http://schemas.microsoft.com/developer/msbuild/2003"
+
+            $propertyGroup = $xml.CreateElement(
+              "PropertyGroup",
+              $namespace
             )
 
-            $signingConfig = @"
-          <PropertyGroup>
-            <GenerateManifests>true</GenerateManifests>
-            <SignManifests>true</SignManifests>
-            <ManifestCertificateThumbprint>$thumb</ManifestCertificateThumbprint>
-            <ManifestKeyFile></ManifestKeyFile>
-          </PropertyGroup>
-          "@
-
-            $text = $text.Replace(
-              "</Project>",
-              "$signingConfig`r`n</Project>"
+            $sign = $xml.CreateElement(
+              "SignManifests",
+              $namespace
             )
 
-            [IO.File]::WriteAllText(
-              $project,
-              $text,
-              [Text.Encoding]::UTF8
+            $sign.InnerText = "true"
+
+            $certificate = $xml.CreateElement(
+              "ManifestCertificateThumbprint",
+              $namespace
             )
 
-            Write-Host "Firma configurada: $project"
+            $certificate.InnerText = $thumb
+
+            $generate = $xml.CreateElement(
+              "GenerateManifests",
+              $namespace
+            )
+
+            $generate.InnerText = "true"
+
+            [void]$propertyGroup.AppendChild($generate)
+            [void]$propertyGroup.AppendChild($sign)
+            [void]$propertyGroup.AppendChild($certificate)
+
+            [void]$xml.DocumentElement.AppendChild(
+              $propertyGroup
+            )
+
+            $xml.Save($project)
           }
 
-          Write-Host "Certificado VSTO preparado."
+          Write-Host "Firma configurada sin modificar ProjectReference."
+
+      - name: Verificar referencias del proyecto
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $projects = @(
+            (Join-Path $env:PROJECT_ROOT "GeoOfficeAI.Word\GeoOfficeAI.Word.csproj"),
+            (Join-Path $env:PROJECT_ROOT "GeoOfficeAI.Excel\GeoOfficeAI.Excel.csproj"),
+            (Join-Path $env:PROJECT_ROOT "GeoOfficeAI.PowerPoint\GeoOfficeAI.PowerPoint.csproj")
+          )
+
+          foreach ($project in $projects) {
+
+            [xml]$xml = Get-Content `
+              -Path $project `
+              -Raw
+
+            $manager = New-Object `
+              System.Xml.XmlNamespaceManager(
+                $xml.NameTable
+              )
+
+            $manager.AddNamespace(
+              "m",
+              "http://schemas.microsoft.com/developer/msbuild/2003"
+            )
+
+            $references = $xml.SelectNodes(
+              "//m:ProjectReference",
+              $manager
+            )
+
+            if (!$references -or $references.Count -eq 0) {
+              throw "Falta ProjectReference en $project"
+            }
+
+            foreach ($reference in $references) {
+              Write-Host "Referencia válida:"
+              Write-Host $reference.Include
+            }
+          }
+
+          Write-Host "Referencias comprobadas."
 
       - name: Compilar Geo Office AI
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Set-Location $env:PROJECT_ROOT
 
           if (!(Test-Path ".\build.ps1")) {
-            throw "No se encontró build.ps1."
+            throw "No existe build.ps1."
           }
+
+          Write-Host "Compilando Word + Excel + PowerPoint..."
 
           .\build.ps1
 
-          if ($LASTEXITCODE -ne 0) {
-            throw "Falló la compilación."
-          }
+          Write-Host "Compilación terminada."
 
-          Write-Host "Word + Excel + PowerPoint compilados."
+      - name: Comprobar archivos VSTO
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $files = @(
+            (Join-Path $env:PROJECT_ROOT "dist\package\Word\GeoOfficeAI.Word.vsto"),
+            (Join-Path $env:PROJECT_ROOT "dist\package\Excel\GeoOfficeAI.Excel.vsto"),
+            (Join-Path $env:PROJECT_ROOT "dist\package\PowerPoint\GeoOfficeAI.PowerPoint.vsto")
+          )
+
+          foreach ($file in $files) {
+
+            if (!(Test-Path $file)) {
+              throw "Falta archivo VSTO: $file"
+            }
+
+            Write-Host "OK:"
+            Write-Host $file
+          }
 
       - name: Instalar Inno Setup
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           choco install innosetup -y --no-progress
 
           if ($LASTEXITCODE -ne 0) {
             throw "No se pudo instalar Inno Setup."
           }
 
+          Write-Host "Inno Setup listo."
+
       - name: Crear instalador EXE
         shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
+
           Set-Location $env:PROJECT_ROOT
 
           $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 
           if (!(Test-Path $iscc)) {
-            throw "No se encontró Inno Setup."
+            throw "No existe ISCC.exe."
           }
 
-          if (!(Test-Path "installer\GeoOfficeAI.iss")) {
-            throw "No se encontró GeoOfficeAI.iss."
+          $script = "installer\GeoOfficeAI.iss"
+
+          if (!(Test-Path $script)) {
+            throw "No existe GeoOfficeAI.iss."
           }
 
-          & $iscc "installer\GeoOfficeAI.iss"
+          Write-Host "Creando instalador..."
+
+          & $iscc $script
 
           if ($LASTEXITCODE -ne 0) {
-            throw "No se pudo crear el EXE."
+            throw "Falló Inno Setup."
           }
 
       - name: Buscar instalador
         shell: pwsh
         run: |
-          $dist = Join-Path $env:PROJECT_ROOT "dist"
+          $ErrorActionPreference = "Stop"
+
+          $dist = Join-Path `
+            $env:PROJECT_ROOT `
+            "dist"
 
           $exe = Get-ChildItem `
             -Path $dist `
@@ -230,10 +362,10 @@ jobs:
             Select-Object -First 1
 
           if (!$exe) {
-            throw "No apareció GeoOfficeAI-Setup.exe."
+            throw "No apareció el instalador EXE."
           }
 
-          Write-Host "Instalador creado:"
+          Write-Host "EXE creado:"
           Write-Host $exe.FullName
 
           "INSTALLER_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
@@ -249,7 +381,10 @@ jobs:
         if: always()
         shell: pwsh
         run: |
-          if (![string]::IsNullOrWhiteSpace($env:VSTO_CERT_THUMBPRINT)) {
+          if (![string]::IsNullOrWhiteSpace(
+            $env:VSTO_CERT_THUMBPRINT
+          )) {
+
             Remove-Item `
               "Cert:\CurrentUser\My\$env:VSTO_CERT_THUMBPRINT" `
               -Force `
