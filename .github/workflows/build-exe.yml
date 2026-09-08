@@ -7,6 +7,7 @@ on:
       - main
     paths:
       - "*.zip"
+      - ".github/workflows/build-exe.yml"
 
 jobs:
   build:
@@ -42,6 +43,7 @@ jobs:
           $root = $solution.Directory.FullName
 
           Write-Host "Proyecto encontrado en: $root"
+
           "PROJECT_ROOT=$root" >> $env:GITHUB_ENV
 
       - name: Preparar Visual Studio y VSTO
@@ -59,9 +61,14 @@ jobs:
             throw "No se encontró Visual Studio."
           }
 
+          Write-Host "Visual Studio encontrado en:"
+          Write-Host $install
+
           $targets = Join-Path $install "MSBuild\Microsoft\VisualStudio\v17.0\OfficeTools\Microsoft.VisualStudio.Tools.Office.targets"
 
           if (!(Test-Path $targets)) {
+            Write-Host "Instalando herramientas Office/VSTO..."
+
             $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
 
             & $setup modify `
@@ -76,56 +83,113 @@ jobs:
             }
           }
 
+          Write-Host "Visual Studio/VSTO preparado."
+
       - name: Colocar inicio de sesión Google
         shell: pwsh
         env:
-          GOOGLE_OAUTH_JSON_B64: ${{ secrets.GOOGLE_OAUTH_JSON_B64 }}
+          GOOGLE_OAUTH_JSON: ${{ secrets.GOOGLE_OAUTH_JSON }}
         run: |
-          if ([string]::IsNullOrWhiteSpace($env:GOOGLE_OAUTH_JSON_B64)) {
-            throw "Falta configurar GOOGLE_OAUTH_JSON_B64 en GitHub Secrets."
+          if ([string]::IsNullOrWhiteSpace($env:GOOGLE_OAUTH_JSON)) {
+            throw "Falta configurar GOOGLE_OAUTH_JSON en GitHub Secrets."
           }
 
-          $file = Join-Path $env:PROJECT_ROOT "GeoOfficeAI.Broker\google_oauth.json"
+          $folder = Join-Path $env:PROJECT_ROOT "GeoOfficeAI.Broker"
 
-          [IO.File]::WriteAllBytes(
+          if (!(Test-Path $folder)) {
+            throw "No se encontró la carpeta GeoOfficeAI.Broker."
+          }
+
+          $file = Join-Path $folder "google_oauth.json"
+
+          [IO.File]::WriteAllText(
             $file,
-            [Convert]::FromBase64String($env:GOOGLE_OAUTH_JSON_B64)
+            $env:GOOGLE_OAUTH_JSON,
+            [Text.Encoding]::UTF8
           )
+
+          if (!(Test-Path $file)) {
+            throw "No se pudo crear google_oauth.json."
+          }
+
+          Write-Host "OAuth de Google configurado correctamente."
 
       - name: Compilar Geo Office AI
         shell: pwsh
         run: |
           Set-Location $env:PROJECT_ROOT
+
+          if (!(Test-Path ".\build.ps1")) {
+            throw "No se encontró build.ps1."
+          }
+
+          Write-Host "Iniciando compilación..."
+
           .\build.ps1
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "La compilación de Geo Office AI falló."
+          }
+
+          Write-Host "Compilación terminada."
 
       - name: Instalar Inno Setup
         shell: pwsh
         run: |
           choco install innosetup -y --no-progress
 
+          if ($LASTEXITCODE -ne 0) {
+            throw "No se pudo instalar Inno Setup."
+          }
+
+          Write-Host "Inno Setup instalado."
+
       - name: Crear instalador EXE
         shell: pwsh
         run: |
           Set-Location $env:PROJECT_ROOT
 
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
-            "installer\GeoOfficeAI.iss"
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
 
-      - name: Comprobar EXE
-        shell: pwsh
-        run: |
-          $exe = Join-Path $env:PROJECT_ROOT "dist\GeoOfficeAI-Setup-v0.5.exe"
-
-          if (!(Test-Path $exe)) {
-            throw "La compilación terminó pero no apareció el instalador EXE."
+          if (!(Test-Path $iscc)) {
+            throw "No se encontró ISCC.exe de Inno Setup."
           }
 
-          Write-Host "EXE creado correctamente:"
-          Write-Host $exe
+          $script = "installer\GeoOfficeAI.iss"
+
+          if (!(Test-Path $script)) {
+            throw "No se encontró installer\GeoOfficeAI.iss."
+          }
+
+          & $iscc $script
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falló la creación del instalador EXE."
+          }
+
+      - name: Buscar EXE generado
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Path $env:PROJECT_ROOT -Filter "*.exe" -Recurse |
+            Where-Object {
+              $_.Name -like "*GeoOfficeAI*Setup*" -or
+              $_.Name -like "*GeoOfficeAI*"
+            } |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (!$exe) {
+            throw "No se encontró ningún instalador EXE generado."
+          }
+
+          Write-Host "EXE encontrado:"
+          Write-Host $exe.FullName
+
+          "INSTALLER_EXE=$($exe.FullName)" >> $env:GITHUB_ENV
 
       - name: Subir EXE
         uses: actions/upload-artifact@v4
         with:
           name: GeoOfficeAI-Windows-Installer
-          path: ${{ env.PROJECT_ROOT }}\dist\GeoOfficeAI-Setup-v0.5.exe
+          path: ${{ env.INSTALLER_EXE }}
           if-no-files-found: error
