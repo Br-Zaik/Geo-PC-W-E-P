@@ -1,0 +1,131 @@
+name: Crear Geo Office AI EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "*.zip"
+
+jobs:
+  build:
+    runs-on: windows-2022
+
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+
+      - name: Buscar y descomprimir ZIP
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem -Path . -Filter "GeoOfficeAI*.zip" |
+            Sort-Object LastWriteTime -Descending |
+            Select-Object -First 1
+
+          if (!$zip) {
+            throw "No se encontró ningún ZIP GeoOfficeAI en el repositorio."
+          }
+
+          Write-Host "Usando ZIP: $($zip.Name)"
+
+          New-Item -ItemType Directory -Force extracted | Out-Null
+          Expand-Archive -Path $zip.FullName -DestinationPath extracted -Force
+
+          $solution = Get-ChildItem extracted -Filter "GeoOfficeAI.sln" -Recurse |
+            Select-Object -First 1
+
+          if (!$solution) {
+            throw "No se encontró GeoOfficeAI.sln dentro del ZIP."
+          }
+
+          $root = $solution.Directory.FullName
+
+          Write-Host "Proyecto encontrado en: $root"
+          "PROJECT_ROOT=$root" >> $env:GITHUB_ENV
+
+      - name: Preparar Visual Studio y VSTO
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+
+          if (!(Test-Path $vswhere)) {
+            throw "Visual Studio no está disponible."
+          }
+
+          $install = & $vswhere -latest -products * -property installationPath
+
+          if ([string]::IsNullOrWhiteSpace($install)) {
+            throw "No se encontró Visual Studio."
+          }
+
+          $targets = Join-Path $install "MSBuild\Microsoft\VisualStudio\v17.0\OfficeTools\Microsoft.VisualStudio.Tools.Office.targets"
+
+          if (!(Test-Path $targets)) {
+            $setup = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\setup.exe"
+
+            & $setup modify `
+              --installPath $install `
+              --add Microsoft.VisualStudio.Workload.Office `
+              --includeRecommended `
+              --quiet `
+              --norestart
+
+            if ($LASTEXITCODE -ne 0 -and $LASTEXITCODE -ne 3010) {
+              throw "No se pudo instalar Office/VSTO."
+            }
+          }
+
+      - name: Colocar inicio de sesión Google
+        shell: pwsh
+        env:
+          GOOGLE_OAUTH_JSON_B64: ${{ secrets.GOOGLE_OAUTH_JSON_B64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:GOOGLE_OAUTH_JSON_B64)) {
+            throw "Falta configurar GOOGLE_OAUTH_JSON_B64 en GitHub Secrets."
+          }
+
+          $file = Join-Path $env:PROJECT_ROOT "GeoOfficeAI.Broker\google_oauth.json"
+
+          [IO.File]::WriteAllBytes(
+            $file,
+            [Convert]::FromBase64String($env:GOOGLE_OAUTH_JSON_B64)
+          )
+
+      - name: Compilar Geo Office AI
+        shell: pwsh
+        run: |
+          Set-Location $env:PROJECT_ROOT
+          .\build.ps1
+
+      - name: Instalar Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup -y --no-progress
+
+      - name: Crear instalador EXE
+        shell: pwsh
+        run: |
+          Set-Location $env:PROJECT_ROOT
+
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" `
+            "installer\GeoOfficeAI.iss"
+
+      - name: Comprobar EXE
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:PROJECT_ROOT "dist\GeoOfficeAI-Setup-v0.5.exe"
+
+          if (!(Test-Path $exe)) {
+            throw "La compilación terminó pero no apareció el instalador EXE."
+          }
+
+          Write-Host "EXE creado correctamente:"
+          Write-Host $exe
+
+      - name: Subir EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: GeoOfficeAI-Windows-Installer
+          path: ${{ env.PROJECT_ROOT }}\dist\GeoOfficeAI-Setup-v0.5.exe
+          if-no-files-found: error
